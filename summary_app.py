@@ -1,5 +1,7 @@
 # app.py
 import os
+import sys
+import subprocess
 from urllib.parse import urlparse, parse_qs
 
 import streamlit as st
@@ -10,51 +12,61 @@ from langchain.chains.summarize import load_summarize_chain
 from langchain.schema import Document
 from langchain_groq import ChatGroq
 
-# If you still want non-YouTube pages:
-from langchain_community.document_loaders import UnstructuredURLLoader, WebBaseLoader
-
-# BYPASS: use get_transcript (no list_transcripts)
-from youtube_transcript_api import YouTubeTranscriptApi, NoTranscriptFound, TranscriptsDisabled, VideoUnavailable
+# Optional: lightweight web loader (avoid Unstructured to keep deps simple)
+import requests
+from bs4 import BeautifulSoup
 
 
 # -----------------------
-# Streamlit page config
+# Ensure correct youtube-transcript-api
 # -----------------------
-st.set_page_config(page_title="LangChain: Summarize Text From YT or Website or Read News", page_icon="🦜")
-st.title("🦜 LangChain: Summarize Text From YT or Website or Read News")
-st.subheader("Summarize URL")
+def ensure_yta():
+    try:
+        import youtube_transcript_api as yta
+        from youtube_transcript_api import YouTubeTranscriptApi
+        # verify the method exists
+        if not hasattr(YouTubeTranscriptApi, "get_transcript"):
+            raise ImportError("YouTubeTranscriptApi missing get_transcript")
+        return yta, YouTubeTranscriptApi
+    except Exception:
+        # Install a known-good version at runtime (works on Streamlit Cloud)
+        subprocess.check_call([sys.executable, "-m", "pip", "install", "-q", "youtube-transcript-api==0.6.2"])
+        import youtube_transcript_api as yta
+        from youtube_transcript_api import YouTubeTranscriptApi
+        return yta, YouTubeTranscriptApi
+
+yta, YouTubeTranscriptApi = ensure_yta()
+
 
 # -----------------------
-# API key handling
+# Streamlit config
 # -----------------------
+st.set_page_config(page_title="Summarize YT / Web (Groq + LangChain)", page_icon="🦜")
+st.title("🦜 Summarize Text From YouTube or Websites")
+st.caption("Groq + LangChain (bypassing list_transcripts)")
+
 with st.sidebar:
-    user_key = st.text_input("Groq API Key (optional if set as Space secret)", value="", type="password")
+    user_key = st.text_input("Groq API Key", type="password", help="Or set GROQ_API_KEY as a secret/env var")
 
-# Prefer user-provided key, else env (add GROQ_API_KEY as a Space secret)
 GROQ_API_KEY = (user_key or os.getenv("GROQ_API_KEY", "")).strip()
 
 @st.cache_resource(show_spinner=False)
 def get_llm(api_key: str):
     if not api_key:
-        raise ValueError("Missing GROQ_API_KEY. Set a Space secret or enter it in the sidebar.")
-    # Build only when needed
+        raise ValueError("Missing GROQ_API_KEY")
     return ChatGroq(model="gemma2-9b-it", api_key=api_key)
 
-# -----------------------
-# Prompt
-# -----------------------
-prompt_template = """Provide a summary of the following content in ~300 words.
-Content:
-{text}
-"""
-prompt = PromptTemplate(template=prompt_template, input_variables=["text"])
+prompt = PromptTemplate(
+    template="Provide a concise summary (~300 words) of the following content:\n\n{text}\n",
+    input_variables=["text"]
+)
+
 
 # -----------------------
-# YouTube helpers (BYPASS list_transcripts)
+# YouTube helpers (no list_transcripts)
 # -----------------------
-def extract_youtube_id(yurl: str) -> str:
-    """Robustly extract video id from watch/shorts/shortened URLs."""
-    u = urlparse(yurl)
+def extract_youtube_id(url: str) -> str:
+    u = urlparse(url)
     host = (u.hostname or "").lower()
     if host in ("youtu.be", "www.youtu.be"):
         return u.path.lstrip("/")
@@ -65,82 +77,83 @@ def extract_youtube_id(yurl: str) -> str:
             parts = u.path.split("/")
             if len(parts) >= 3:
                 return parts[2]
-        # Fallback for embeds or other paths: try v= first
         vid = parse_qs(u.query).get("v", [""])[0]
         if vid:
             return vid
-    raise ValueError("Unsupported YouTube URL format")
+    raise ValueError("Unsupported YouTube URL")
 
-def load_youtube_as_docs(yurl: str, languages=("en", "en-US", "en-GB")) -> list[Document]:
-    """
-    Get transcript using get_transcript only (no list_transcripts).
-    If no transcript is found for preferred languages, try without languages (let the API pick).
-    """
-    vid = extract_youtube_id(yurl)
-
-    # Try preferred languages first
+def load_youtube_docs(url: str, languages=("en", "en-US", "en-GB")):
+    vid = extract_youtube_id(url)
     try:
         transcript = YouTubeTranscriptApi.get_transcript(vid, languages=list(languages))
-    except NoTranscriptFound:
-        # Try letting the lib pick any available transcript (original language)
+    except Exception:
+        # Let the library pick any available transcript
         transcript = YouTubeTranscriptApi.get_transcript(vid)
-    except (TranscriptsDisabled, VideoUnavailable) as e:
-        raise RuntimeError(f"Transcript not available: {e}")
-
-    text = " ".join(chunk["text"] for chunk in transcript if chunk.get("text"))
+    text = " ".join(ch["text"] for ch in transcript if ch.get("text"))
     if not text.strip():
-        raise RuntimeError("Transcript is empty.")
-    return [Document(page_content=text, metadata={"source": yurl})]
+        raise RuntimeError("Transcript is empty or unavailable for this video.")
+    return [Document(page_content=text, metadata={"source": url})]
+
 
 # -----------------------
-# UI inputs
+# Simple web page loader (keeps Space light)
 # -----------------------
-url = st.text_input("URL", label_visibility="collapsed")
+def load_web_docs(url: str):
+    headers = {"User-Agent": "Mozilla/5.0"}
+    r = requests.get(url, headers=headers, timeout=20)
+    r.raise_for_status()
+    soup = BeautifulSoup(r.text, "lxml")
+    # crude extract: join paragraphs
+    paragraphs = [p.get_text(" ", strip=True) for p in soup.select("p")]
+    text = " ".join(p for p in paragraphs if p)
+    if not text.strip():
+        raise RuntimeError("Could not extract readable text from the page.")
+    return [Document(page_content=text, metadata={"source": url})]
+
 
 # -----------------------
-# Actions
+# UI
 # -----------------------
-if st.button("Summarize the Content from YT or Articles"):
-    # Basic validation
-    if not GROQ_API_KEY or not url.strip():
-        st.error("Please provide the Groq API Key (sidebar) and a URL.")
-    elif not validators.url(url):
-        st.error("Please enter a valid URL (YouTube or website).")
-    else:
-        try:
-            with st.spinner("Loading & summarizing..."):
-                # Build docs
-                if ("youtube.com" in url) or ("youtu.be" in url):
-                    docs = load_youtube_as_docs(url)
-                else:
-                    # You can remove UnstructuredURLLoader if you want fewer deps
-                    loader = UnstructuredURLLoader(
-                        urls=[url],
-                        ssl_verify=False,
-                        headers={"User-Agent": "Mozilla/5.0"}
-                    )
-                    docs = loader.load()
+url = st.text_input("Paste a YouTube or webpage URL")
 
-                # LLM + chain
-                llm = get_llm(GROQ_API_KEY)
-                chain = load_summarize_chain(llm, chain_type="stuff", prompt=prompt)
-                summary = chain.run(docs)
+col1, col2 = st.columns(2)
+with col1:
+    summarize_btn = st.button("Summarize")
+with col2:
+    news_btn = st.button("Read BBC Homepage")
 
-                st.success(summary)
-        except Exception as e:
-            st.exception(f"Exception: {e}")
-
-elif st.button("Read Today's News"):
+if summarize_btn:
     if not GROQ_API_KEY:
-        st.error("Please provide the Groq API Key in the sidebar or as a Space secret.")
-    else:
-        try:
-            with st.spinner("Reading News.."):
-                loader = WebBaseLoader("https://www.bbc.com")
-                docs = loader.load()
-                llm = get_llm(GROQ_API_KEY)
-                chain = load_summarize_chain(llm, chain_type="stuff", prompt=prompt)
-                summary = chain.run(docs)
-                st.success(summary)
-        except Exception as e:
-            st.exception(f"Exception: {e}")
+        st.error("Please set your Groq API key (sidebar or env var GROQ_API_KEY).")
+        st.stop()
+    if not url or not validators.url(url):
+        st.error("Please enter a valid URL.")
+        st.stop()
+
+    try:
+        with st.spinner("Fetching & summarizing..."):
+            if ("youtube.com" in url) or ("youtu.be" in url):
+                docs = load_youtube_docs(url)
+            else:
+                docs = load_web_docs(url)
+
+            llm = get_llm(GROQ_API_KEY)
+            chain = load_summarize_chain(llm, chain_type="stuff", prompt=prompt)
+            summary = chain.run(docs)
+            st.success(summary)
+    except Exception as e:
+        st.exception(f"Exception: {e}")
+
+if news_btn:
+    if not GROQ_API_KEY:
+        st.error("Please set your Groq API key (sidebar or env var GROQ_API_KEY).")
+        st.stop()
+    try:
+        with st.spinner("Loading BBC homepage..."):
+            docs = load_web_docs("https://www.bbc.com")
+            llm = get_llm(GROQ_API_KEY)
+            chain = load_summarize_chain(llm, chain_type="stuff", prompt=prompt)
+            summary = chain.run(docs)
+            st.success(summary)
+    except Exception as e:
+        st.exception(f"Exception: {e}")
