@@ -24,7 +24,7 @@ arxiv
 wikipedia
 duckduckgo-search
 validators
-youtube_transcript_api=1.1.1
+youtube_transcript_api == 1.1.1
 unstructured
 pytube
 numexpr
