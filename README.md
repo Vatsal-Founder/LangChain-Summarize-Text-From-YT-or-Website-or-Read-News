@@ -6,9 +6,9 @@ An end‑to‑end Generative AI app (built with **LangChain**) that:
 * **Summarizes any public website** (article/blog/docs)
 * **Summarizes today’s news** into quick briefs
 
-> Repo layout includes `summary_app.py`, `requirements.txt`, and a notebook for experiments (`text_summarize.ipynb`). 
+> Repo layout includes `app.py`, `requirements.txt`, and a notebook for experiments (`text_summarize.ipynb`). 
 
-Link:
+* Link: https://langchain-summarize-text-from-yt-or-website-or-read-news-abwfi.streamlit.app
 ---
 
 ## Features
