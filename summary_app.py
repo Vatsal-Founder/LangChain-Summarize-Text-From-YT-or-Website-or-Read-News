@@ -37,6 +37,11 @@ def ensure_yta():
 
 yta, YouTubeTranscriptApi = ensure_yta()
 
+import inspect
+st.write("yta file:", getattr(yta, "__file__", "unknown"))
+from youtube_transcript_api import YouTubeTranscriptApi
+st.write("has get_transcript:", hasattr(YouTubeTranscriptApi, "get_transcript"))
+
 
 # -----------------------
 # Streamlit config
